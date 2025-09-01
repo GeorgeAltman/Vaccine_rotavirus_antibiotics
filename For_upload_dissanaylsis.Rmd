@@ -1,0 +1,428 @@
+---
+title: "Dissertation"
+author: "George Altman"
+date: "2025-08-21"
+output: html_document
+
+# NOTE FOR REVIEWERS / APPENDIX USE:
+# This script is provided for methods transparency. It is NOT runnable as-is:
+# - All file paths and filenames are redacted.
+# - Input data are protected (CPRD) and cannot be shared.
+---
+
+```{r setup, include=TRUE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+## Load packages
+library(data.table)
+library(lubridate)
+library(dplyr)
+library(tictoc)       
+library(ggplot2)
+library(tableone)     
+library(survival)   
+library(knitr)
+library(kableExtra) 
+library(broom)        
+library(coxme)        
+library(casebase)
+library(gtsummary)
+library(forcats)
+library(ggsurvfit)
+library(survRM2)
+library(newTestSurvRec)
+library(car)
+library(ggcorrplot)
+library(purrr)
+```
+
+Load datasets ag_ready includes multiple lines per participants and multiple events , ag_ready_descrip is collapsed to first event and one line per participant. 
+
+```{r load}
+if (exists("continue", inherits = TRUE)) try(rm(continue), silent = TRUE)
+
+# Load ag_ready (multiple rows per child)
+ag_ready <- readRDS("dataprivate")
+
+# Load ag_ready_descrip (collapsed to one row per child)
+ag_ready_descrip <- readRDS("dataprivate")
+
+
+# check: exactly one row per patid in ag_ready_descrip
+n_total  <- nrow(ag_ready_descrip)
+n_unique <- dplyr::n_distinct(ag_ready_descrip$patid)
+cat("Rows:", n_total, "  Unique patid:", n_unique, "\n")
+stopifnot(n_total == n_unique)  
+
+
+dup_n <- n_total - n_unique
+if (dup_n > 0) {
+  warning(dup_n, " duplicate patid rows found in ag_ready_descrip")
+}
+
+```
+
+clean and remove 0 follow up and intederminate gender
+
+```{r cleanandremove3rdgender}
+
+#remove 3 for gender 
+
+# Remove patients with gender coded as 3
+ag_ready <- ag_ready[gender %in% c(1, 2) | is.na(gender)]
+
+# Remove gender 3 from ag_ready_descrip as well
+ag_ready_descrip <- ag_ready_descrip[gender %in% c(1, 2) | is.na(gender)]
+
+#remove any negative or 0 follow up days 
+ag_ready_clean <- ag_ready[stop_time_days > start_time_days, ]
+
+```
+
+Labelling for descriptive analysis 
+
+```{r tidynames}
+
+#label eligibility 
+ag_ready_descrip[, rota_group_label := factor(
+  rota_group,
+  levels = c(0, 1),
+  labels = c("Ineligible", "Eligible")
+)]
+
+#label rota vaccination status
+ag_ready_descrip[, rota_vacc_label := factor(
+  rota_vacc,
+  levels = c(FALSE, TRUE),
+  labels = c("Unvaccinated", "Vaccinated")
+)]
+
+#label PCV vaccination
+ag_ready_descrip[, pcv_vacc_label := factor(pcv_vacc, levels = c(FALSE, TRUE), labels = c("Unvaccinated", "Vaccinated"))]
+
+#label gender
+ag_ready_descrip[, gender_label := factor(gender, levels = c(1, 2), labels = c("Male", "Female"))]
+
+#label urban/rural
+ag_ready_descrip[, urban_rural_label := factor(e2011_urban_rural, levels = c(1, 2), labels = c("Urban", "Rural"))]
+
+#label IMD
+ag_ready_descrip[, imd_label := factor(
+  e2019_imd_5, levels = 1:5,
+  labels = c("IMD 1 (most deprived)", "IMD 2", "IMD 3", "IMD 4", "IMD 5 (least deprived)"),
+  ordered = TRUE
+)]
+
+
+# labelled co-morbidity for descriptives
+ag_ready_descrip[, has_comorbidity_label := factor(
+  has_comorbidity,
+  levels = c(0, 1),
+  labels = c("No comorbidity", "≥1 comorbidity")
+)]
+
+#label missing
+ag_ready_descrip[, has_comorbidity_label := forcats::fct_explicit_na(has_comorbidity_label, "Missing")]
+
+
+# Add "Missing" label
+label_cols <- c("rota_group_label","rota_vacc_label","pcv_vacc_label",
+                "gender_label","urban_rural_label","imd_label", "has_comorbidity_label")
+ag_ready_descrip[, (label_cols) := lapply(.SD, forcats::fct_explicit_na, na_level = "Missing"),
+                 .SDcols = label_cols]
+
+
+```
+
+
+Table one with no follow ups removed 
+
+```{r table1_tableone_last2, echo=FALSE, message=FALSE, warning=FALSE}
+library(tableone)
+library(dplyr)
+library(knitr)
+library(kableExtra)
+
+# ---- Analysis set: mirror STROBE/final model ----
+dat_t1 <- ag_ready_descrip %>%
+  filter(
+    !is.na(rota_vacc),
+    !is.na(e2019_imd_5),
+    !is.na(e2011_urban_rural),
+    !is.na(followup_days),
+    followup_days > 0                 # <-- exclude 0/negative follow-up (n = 166)
+  ) %>%
+  mutate(
+    # strata
+    rota_vacc_label2 = factor(rota_vacc,
+                              levels = c(TRUE, FALSE),
+                              labels = c("Vaccinated", "Unvaccinated")),
+    # variables to show
+    sex_label   = factor(gender, levels = c(1, 2), labels = c("Male", "Female")),
+    imd_label2  = factor(e2019_imd_5, levels = 1:5,
+                         labels = c("IMD 1 (most deprived)", "IMD 2", "IMD 3",
+                                    "IMD 4", "IMD 5 (least deprived)")),
+    ur_label2   = factor(e2011_urban_rural, levels = c(1, 2), labels = c("Urban", "Rural")),
+    pcv_label   = factor(pcv_vacc, levels = c(FALSE, TRUE), labels = c("Unvaccinated","Vaccinated")),
+    comborb_lbl = factor(has_comorbidity, levels = c(0, 1), labels = c("No comorbidity","≥1 comorbidity")),
+    abx_event   = factor(ifelse(event == 1, 1, 0), levels = c(0, 1), labels = c("No","Yes"))
+  )
+
+# ---- Variables to include ----
+vars <- c("sex_label", "imd_label2", "ur_label2",
+          "pcv_label", "comborb_lbl", "abx_event",
+          "followup_days")
+
+catVars <- c("sex_label", "imd_label2", "ur_label2",
+             "pcv_label", "comborb_lbl", "abx_event")
+
+# ---- Nice labels (attach as variable attributes so varLabels=TRUE works) ----
+labels <- c(
+  sex_label     = "Sex",
+  imd_label2    = "IMD quintile",
+  ur_label2     = "Urban/Rural",
+  pcv_label     = "PCV vaccination",
+  comborb_lbl   = "Comorbidity",
+  abx_event     = "Any antibiotic prescription event",
+  followup_days = "Follow-up (days)"
+)
+for (v in names(labels)) attr(dat_t1[[v]], "label") <- labels[[v]]
+
+# ---- Build TableOne object (Overall + groups) ----
+tab1 <- CreateTableOne(
+  vars       = vars,
+  strata     = "rota_vacc_label2",
+  data       = dat_t1,
+  factorVars = catVars,
+  addOverall = TRUE
+)
+
+# ---- Export to matrix with labels; mark non-default tests; add '*' to p; drop 'test' ----
+tab1_mat <- print(
+  tab1,
+  showAllLevels = TRUE,
+  varLabels     = TRUE,                # use variable labels we set above
+  quote         = FALSE,
+  noSpaces      = TRUE,
+  formatOptions = list(big.mark = ","),
+  printToggle   = FALSE,
+  nonnormal     = "followup_days",     # Wilcoxon/Kruskal for follow-up
+  exact         = c("pcv_label", "abx_event")  # Fisher’s exact for these
+)
+
+# Rename the first row 'n' to 'Population (n)'
+if (nrow(tab1_mat) > 0 && rownames(tab1_mat)[1] == "n") {
+  rownames(tab1_mat)[1] <- "Population (n)"
+}
+
+# Add asterisk to p-values where a non-default test was used, then drop 'test' column
+if ("test" %in% colnames(tab1_mat) && "p" %in% colnames(tab1_mat)) {
+  tab1_mat[, "p"] <- ifelse(!is.na(tab1_mat[, "test"]) & tab1_mat[, "test"] != "",
+                            paste0(tab1_mat[, "p"], " *"),
+                            tab1_mat[, "p"])
+  tab1_mat <- tab1_mat[, setdiff(colnames(tab1_mat), "test")]
+}
+
+# ---- Render ----
+kable(
+  tab1_mat,
+  caption = "Table 1. Baseline characteristics by rotavirus vaccination status",
+  align   = "lcccr"  # label | Overall | Vaccinated | Unvaccinated | p
+) %>%
+  kable_styling(bootstrap_options = c("striped","condensed"), full_width = FALSE) %>%
+  footnote(
+    general = "* Non-default tests: Fisher’s exact for small/imbalanced categorical cells; Wilcoxon rank-sum for skewed continuous variables (Follow-up days)."
+  )
+```
+
+
+cumulative incidence plot 
+
+```{r cumulativeincidence, echo=FALSE, message=FALSE, warning=FALSE}
+
+library(dplyr)
+library(survival)
+library(ggsurvfit)
+library(scales)
+
+# 1) Analysis set: keep rows with vaccine status + time + event defined
+dat_km <- ag_ready_descrip |>
+  filter(!is.na(rota_vacc),
+         !is.na(stop_time_days),
+         !is.na(event)) |>
+  mutate(
+    rota_vacc_label = factor(
+      rota_vacc, levels = c(FALSE, TRUE),
+      labels = c("Unvaccinated", "Vaccinated")
+    )
+  )
+
+# 2) KM fit (time to first event) = 1 - S(t)
+fit_km <- survfit2(Surv(stop_time_days, event) ~ rota_vacc_label, data = dat_km)
+
+# 3) Plot: cumulative incidence
+ggsurvfit(fit_km, type = "risk") +
+  add_confidence_interval() +
+  add_risktable(
+    times = 365.25*c(2,4,6),              # 2y, 4y, 6y (no baseline row)
+    label_headers = c(n.risk = "At Risk", n.event = "Events"),
+    size = 3
+  ) +
+  scale_x_continuous(
+    breaks = 365.25*c(0,2,4,6), labels = c("0","2","4","6"),
+    expand = expansion(mult = c(0.02, 0.02))
+  ) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  labs(x = "Years since age 6 months", y = "Cumulative incidence (%)") +
+  theme_minimal(base_size = 13) +
+  theme(plot.margin = margin(6, 10, 20, 6))
+
+
+```
+
+
+Combined univariate and multivariate table 
+
+
+```{r table2_crude_adjusted, echo=FALSE, message=FALSE, warning=FALSE}
+
+
+# Helper: p-value
+# -------------------------------
+p_stars <- function(p) {
+  case_when(
+    is.na(p)        ~ "",
+    p < 0.001       ~ "***",
+    p < 0.01        ~ "**",
+    p < 0.05        ~ "*",
+    TRUE            ~ ""
+  )
+}
+
+# -------------------------------
+# Analysis dataset for models
+# -------------------------------
+dat_tbl2 <- ag_ready %>%
+  filter(
+    stop_time_days > start_time_days,
+    !is.na(rota_vacc),
+    !is.na(pcv_vacc)
+  ) %>%
+  mutate(
+    # label all covariates
+    rota_vacc_f = factor(rota_vacc, levels = c(FALSE, TRUE),
+                         labels = c("Unvaccinated", "Vaccinated")),
+    pcv_vacc_f  = factor(pcv_vacc, levels = c(FALSE, TRUE),
+                         labels = c("Unvaccinated", "Vaccinated")),
+    sex         = factor(gender, levels = c(1, 2), labels = c("Male", "Female")),
+    e2019_imd_5 = factor(e2019_imd_5, levels = 1:5,
+                         labels = c("IMD 1 (most deprived)", "IMD 2", "IMD 3",
+                                    "IMD 4", "IMD 5 (least deprived)")),
+    e2011_urban_rural = factor(e2011_urban_rural, levels = c(1, 2),
+                               labels = c("Urban", "Rural")),
+    mob         = factor(mob),
+    patid       = factor(patid)
+  )
+
+# Which variables to show 
+var_map <- tibble::tribble(
+  ~var,               ~block_label,
+  "rota_vacc_f",      "Rotavirus vaccination",
+  "pcv_vacc_f",       "PCV vaccination",
+  "sex",              "Sex",
+  "e2019_imd_5",      "IMD quintile",
+  "e2011_urban_rural","Urban/Rural",
+  "mob",              "Month of birth"
+)
+
+# -----------------------------------
+# 1) CRUDE (univariable) Cox models
+# -----------------------------------
+fit_one_crude <- function(v) {
+  fml <- as.formula(paste0("Surv(start_time_days, stop_time_days, event) ~ ",
+                           v, " + cluster(patid)"))
+  fit <- coxph(fml, data = dat_tbl2, ties = "efron")
+  broom.helpers::tidy_plus_plus(fit, exponentiate = TRUE, conf.int = TRUE) %>%
+    mutate(var = v)
+}
+
+crude_df <- var_map$var %>%
+  map_df(fit_one_crude) %>%
+  filter(!.data$variable %in% "(Intercept)") %>%
+  mutate(
+    block_label = dplyr::recode(var, !!!setNames(var_map$block_label, var_map$var)),
+    level_label = .data$label,
+    # format HR (95% CI)
+    crude_hr = sprintf("%.2f (%.2f–%.2f)", estimate, conf.low, conf.high),
+    crude_hr = ifelse(reference_row, "ref", crude_hr),
+    crude_p  = ifelse(reference_row, "", p_stars(p.value))
+  ) %>%
+  select(block_label, level_label, crude_hr, crude_p, var, reference_row)
+
+# -----------------------------------
+# 2) ADJUSTED (multivariable) Cox model
+# -----------------------------------
+m_final <- coxph(
+  Surv(start_time_days, stop_time_days, event) ~
+    rota_vacc_f + pcv_vacc_f + sex + e2019_imd_5 + e2011_urban_rural + mob +
+    cluster(patid),
+  data = dat_tbl2,
+  ties = "efron"
+)
+
+adj_df <- broom.helpers::tidy_plus_plus(m_final, exponentiate = TRUE, conf.int = TRUE) %>%
+  mutate(
+    var         = .data$variable,
+    block_label = dplyr::recode(var, !!!setNames(var_map$block_label, var_map$var)),
+    level_label = .data$label,
+    adj_hr      = sprintf("%.2f (%.2f–%.2f)", estimate, conf.low, conf.high),
+    adj_hr      = ifelse(reference_row, "ref", adj_hr),
+    adj_p       = ifelse(reference_row, "", p_stars(p.value))
+  ) %>%
+  filter(var %in% var_map$var) %>%
+  select(block_label, level_label, adj_hr, adj_p, var, reference_row)
+
+# -----------------------------------
+# 3) Join crude + adjusted and order 
+# -----------------------------------
+tbl2 <- full_join(crude_df, adj_df,
+                  by = c("block_label","level_label","var","reference_row")) %>%
+  arrange(
+    factor(block_label, levels = var_map$block_label),
+    desc(reference_row),  
+    level_label
+  ) %>%
+  select(
+    Characteristic = block_label,
+    level_label,
+    `Crude HR (95% CI)` = crude_hr,
+    `p*` = crude_p,
+    `Adjusted HR (95% CI)` = adj_hr,
+    `p**` = adj_p
+  )
+
+# Make a single “Characteristic” column 
+tbl2 <- tbl2 %>%
+  group_by(Characteristic) %>%
+  mutate(Characteristic = ifelse(row_number() == 1, Characteristic, "")) %>%
+  ungroup() %>%
+  rename(` ` = level_label)   # second column = level names
+
+# -----------------------------------
+# 4) Print
+# -----------------------------------
+kable(
+  tbl2,
+  align = c("l","l","c","c","c","c"),
+  caption = "Table 2. Andersen–Gill Cox models: crude and adjusted estimates"
+) %>%
+  kable_styling(bootstrap_options = c("striped","condensed"), full_width = FALSE) %>%
+  add_footnote(
+    label = c(
+      "* p<0.05, ** p<0.01, *** p<0.001",
+      "Reference levels shown as “ref”. Crude = univariable model (one covariate at a time). Adjusted model includes all listed covariates clustered by patient."
+    ),
+    notation = "symbol"
+  )
+
+
+```
